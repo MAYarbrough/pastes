@@ -1,0 +1,518 @@
+package org.redhat.mike;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.Map.Entry;
+import java.util.Stack;
+import java.util.StringJoiner;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.drools.compiler.builder.impl.KnowledgeBuilderConfigurationImpl;
+import org.drools.compiler.compiler.DrlParser;
+import org.drools.compiler.compiler.DroolsError;
+import org.drools.compiler.compiler.DroolsParserException;
+import org.drools.compiler.lang.descr.AccumulateDescr;
+import org.drools.compiler.lang.descr.AccumulateDescr.AccumulateFunctionCallDescr;
+import org.drools.compiler.lang.descr.AndDescr;
+import org.drools.compiler.lang.descr.AttributeDescr;
+import org.drools.compiler.lang.descr.BaseDescr;
+import org.drools.compiler.lang.descr.ConditionalElementDescr;
+import org.drools.compiler.lang.descr.EvalDescr;
+import org.drools.compiler.lang.descr.ExistsDescr;
+import org.drools.compiler.lang.descr.ExprConstraintDescr;
+import org.drools.compiler.lang.descr.ForallDescr;
+import org.drools.compiler.lang.descr.FromDescr;
+import org.drools.compiler.lang.descr.GlobalDescr;
+import org.drools.compiler.lang.descr.ImportDescr;
+import org.drools.compiler.lang.descr.NotDescr;
+import org.drools.compiler.lang.descr.OrDescr;
+import org.drools.compiler.lang.descr.PackageDescr;
+import org.drools.compiler.lang.descr.PatternDescr;
+import org.drools.compiler.lang.descr.PatternSourceDescr;
+import org.drools.compiler.lang.descr.RuleDescr;
+import org.kie.internal.builder.KnowledgeBuilderConfiguration;
+import org.kie.internal.builder.KnowledgeBuilderFactory;
+import org.kie.internal.builder.conf.EvaluatorOption;
+
+import com.cigna.coderunner.drools.operators.ValueEvaluatorDefinition;
+
+/**
+ * 
+ * Formatting writer rules:
+ * each parent is responsible for printing the leading indent for it's children
+ * each parent is responsible for incrementing and decrementing the indent counter before and after printing children
+ * when each method is done, the cursor is at the beginning of a new line
+ * if child descrs are patterns, they start on the same line that the parentheses is on. otherwise start one line down and one indent over
+ * 
+ * 
+ * @author G95118
+ *
+ */
+public class RuleWriter {
+	
+	private static final String RN = "\r\n";
+	private static final String T = "    ";
+	private int indent = 0;
+	
+	private StringStack lines = new StringStack();
+	private HashSet<String> lhsFactIds = new HashSet<>();
+	private HashSet<String> rhsFactIds = new HashSet<>();
+	private boolean patternConstraintNl = true;
+	private boolean mapAnalysis = true;
+
+	public static String formatFile(String filepath) throws DroolsParserException {
+		
+		String ruleFileText;
+		try {
+			ruleFileText = new String(Files.readAllBytes(Paths.get(filepath)), StandardCharsets.UTF_8);
+		} catch (Exception e) {
+			throw new DroolsParserException("Unable to load file at " + filepath, e);
+		}
+		
+		return formatFileContents(ruleFileText);
+	}
+
+	public static String formatFileContents(String ruleFileText) throws DroolsParserException {
+		PackageDescr rulesPackageDescriptor = parseFileContents(ruleFileText);
+		
+		return new RuleWriter()._format(rulesPackageDescriptor);
+	}
+
+	public static PackageDescr parseFileContents(String ruleFileText) throws DroolsParserException {
+		//initiate the DRL parser
+	    KnowledgeBuilderConfiguration conf = KnowledgeBuilderFactory.newKnowledgeBuilderConfiguration();
+	    conf.setOption(EvaluatorOption.get("containsValue", new ValueEvaluatorDefinition()));
+	    DrlParser parser = new DrlParser(((KnowledgeBuilderConfigurationImpl)conf).getLanguageLevel());
+	
+		//parse a full drl file into a Package Descriptor (this can include multiple rules)
+		PackageDescr rulesPackageDescriptor = parser.parse(null, ruleFileText);
+		
+		if(null == rulesPackageDescriptor) {
+			DroolsError e = parser.getErrors().get(0);
+			throw new DroolsParserException(e.getMessage());
+		}
+		return rulesPackageDescriptor;
+	}
+
+	public static String formatPackage(PackageDescr rulesPackageDescriptor) {
+		return new RuleWriter()._format(rulesPackageDescriptor);
+	}
+
+	public static String formatRule(RuleDescr rule) {
+		return new RuleWriter()._format(rule);
+	}
+
+	public HashSet<String> getLhsFactIds() {
+		return lhsFactIds;
+	}
+
+	public HashSet<String> getRhsFactIds() {
+		return rhsFactIds;
+	}
+
+	private void autoFormat(BaseDescr descr) {
+		try {
+			FormatAction.valueOf(descr.getClass().getSimpleName()).format(this, descr);
+		} catch(IllegalArgumentException e){
+			throw new IllegalArgumentException("Unknown Descr " + descr.getClass(), e);
+		}
+	}
+	
+	private String _format(NotDescr descr) {
+		lines.peek().append("not ");
+		for( BaseDescr child : ((ConditionalElementDescr)descr).getDescrs() ){
+			indent++;
+			autoFormat(child);
+			indent--;
+			lines.peek().append(getIndent());
+			lines.push(new StringBuilder());
+		}
+		return "not";
+	}
+	
+	private String _format(ExistsDescr descr) {
+		lines.peek().append("exists ");
+		for( BaseDescr child : ((ConditionalElementDescr)descr).getDescrs() ){
+			indent++;
+			autoFormat(child);
+			indent--;
+			lines.peek().append(getIndent());
+			lines.push(new StringBuilder());
+		}
+		return "exists";
+	}
+
+	private String _format(PackageDescr pack) {
+		
+		if(null != pack.getNamespace()) {
+			lines.peek().append("package ").append(pack.getNamespace()).append(";");
+			lines.push(new StringBuilder());
+		}
+
+		if(!pack.getImports().isEmpty()) {
+			lines.push(new StringBuilder());
+			for(ImportDescr imprt : pack.getImports()) {
+				_format(imprt);
+			}
+		}
+
+		if(!pack.getGlobals().isEmpty()) {
+			lines.push(new StringBuilder());
+			for(GlobalDescr global : pack.getGlobals()) {
+				_format(global);
+			}
+		}
+
+		for (RuleDescr rule : pack.getRules()) {
+			lines.push(new StringBuilder());
+			_format(rule);
+		}
+		
+		return lines.toString();
+	}
+
+	private void _format(ImportDescr imprt) {
+		lines.peek().append(imprt.toString());
+		lines.push(new StringBuilder());
+	}
+
+	private void _format(GlobalDescr global) {
+		lines.peek().append("global ").append(global.getType()).append(" ").append(global.getIdentifier());
+		lines.push(new StringBuilder());
+	}
+
+	private String _format(RuleDescr rule) {
+		indent = 0;
+		lines.peek().append("rule \"").append(rule.getName()).append("\"");
+		indent = 1;
+		for(Entry<String, AttributeDescr> attrib : rule.getAttributes().entrySet()) {
+			lines.push(new StringBuilder(getIndent()).append(attrib.getKey()).append(" ").append(attrib.getValue().getValueString()));
+		}
+		lines.push(new StringBuilder(getIndent()).append("when"));
+		lines.push(new StringBuilder());
+		indent = 2;
+		for (BaseDescr descr : rule.getLhs().getDescrs()) {
+			lines.peek().append(getIndent());
+			autoFormat(descr);
+		}
+		indent = 1;
+		lines.peek().append(getIndent()).append("then");
+		lines.push(new StringBuilder());
+		indent = 2;
+		for(String line : rule.getConsequence().toString().trim().replaceAll("\\s+", " ").split("; *")){
+			lines.peek().append(getIndent()).append(line).append(";");
+			lines.push(new StringBuilder());
+		}
+		
+		if(mapAnalysis ) {
+			findFactIds(rule.getConsequence().toString(), rhsFactIds);
+		}
+		
+		indent = 0;
+		lines.peek().append("end");
+		lines.push(new StringBuilder());
+		
+		return lines.toString();
+	}
+
+	private String getIndent() {
+		StringBuilder sb = new StringBuilder();
+		for(int i = 0; i<indent; i++){
+			sb.append(T);
+		}
+		return sb.toString();
+	}
+
+	private String _format(EvalDescr descr) {
+		lines.peek().append("eval(").append(descr.toString()).append(")");
+		lines.push(new StringBuilder());
+		return "evalDescr";
+	}
+
+	private String _format(AccumulateDescr descr) {
+		lines.peek().append("from accumulate (");
+		autoFormat(descr.getInput());
+		
+		for(AccumulateFunctionCallDescr func : descr.getFunctions()) {
+			lines.peek().append(", ").append(func.getFunction()).append("(");
+			StringJoiner join = new StringJoiner(", ");
+			for(String param : func.getParams()) {
+				join.add(param);
+			}
+			lines.peek().append(join.toString());
+			lines.peek().append(")");
+		}
+		lines.peek().append(")");
+		lines.push(new StringBuilder());
+		return "AccumulateDescr";
+	}
+	
+	private String _format(ForallDescr descr) {
+		lines.peek().append("forall ( ");
+		for( BaseDescr child : ((ConditionalElementDescr)descr).getDescrs() ){
+			indent++;
+			autoFormat(child);
+			indent--;
+			lines.peek().append(getIndent()).append(")");
+			lines.push(new StringBuilder());
+		}
+		return "forall";
+	}
+
+	private String _format(AndDescr descr) {
+		return _formatAndOr(descr, "&&");
+	}
+	
+	private String _format(OrDescr descr) {
+		return _formatAndOr(descr, "||");
+	}
+	
+	private String _formatAndOr(ConditionalElementDescr descr, String operator) {
+		//XXX: if there's only one, do i need to indent, or just print the child? will there ever be only one? Is there an AndDescr with one by default if someone puts extraneous parentheses around a pattern?
+		
+		if(descr.getDescrs().size() > 1) {
+			// if there's more than one, add a parentheses
+			lines.peek().append("( ");
+			
+			Iterator<? extends BaseDescr> i = descr.getDescrs().iterator();
+			while(i.hasNext()) {
+				BaseDescr child = i.next();
+				// if the child is a pattern, print it on the same line, otherwise move down and over
+				indent++;
+				if(child instanceof PatternDescr) {
+					lines.peek().append(" ");
+				} else {
+					lines.push(new StringBuilder(getIndent()));
+				}
+				autoFormat(child);
+				indent--;
+				
+				if(i.hasNext()) {
+					lines.peek().append(getIndent() + operator);
+				}
+			}
+
+			// more than one, final parentheses
+			lines.peek().append(getIndent()).append(")");
+			lines.push(new StringBuilder());
+		} else {
+//			ret = autoFormat(descr.getDescrs().iterator().next());
+			throw new RuntimeException("does this ever happen?");
+		}
+		return "formatAndOr";
+	}
+	
+	private String _format(PatternSourceDescr descr) {
+		lines.peek().append(descr.toString());
+		return "PatternSourceDescr";
+	}
+	
+	private String _format(PatternDescr descr) {
+		
+		// if the object of the pattern is assigned to a variable add that
+		if(null != descr.getIdentifier()) {
+			lines.peek().append(descr.getIdentifier()).append(" : ");	
+		}
+		
+		// print the object type and capture the length that we're currently at
+		lines.peek().append(descr.getObjectType());
+		
+		if(descr.getConstraint().getDescrs().isEmpty()) {
+			lines.peek().append("()");
+		} else {
+			System.out.println(descr.toString());
+			int constraintIndent = lines.peek().length()-getIndent().length();
+			
+			// start the constraints, indent them to the length that we captured previously
+			lines.peek().append("( ");
+			if (descr.getConstraint().getDescrs().size() == 1) {
+				String descr1 = descr.getConstraint().getDescrs().get(0).getText().replace("\t", "");
+				String[] parts = descr1.split("\r\n &&");
+				String test = "";
+				indent++;
+				indent++;
+				for(int w=0; w < parts.length; w++) {
+					if(w == parts.length-1) {
+						test = test + parts[w];
+						lines.push(new StringBuilder(getIndent()).append(parts[w].replace(")\n",")")));
+					} else {
+						test = test + parts[w] + (" && \n");
+						parts[w] = parts[w] + (" && ");
+						lines.push(new StringBuilder(getIndent()).append(parts[w]));
+					}
+				}
+
+				indent++;
+				
+				lines.peek().append(" )");
+
+			} else {
+				Iterator<? extends BaseDescr> i = descr.getConstraint().getDescrs().iterator();
+				
+				while(i.hasNext()) {
+					autoFormat(i.next());
+					if(i.hasNext()) {
+						if(patternConstraintNl) {
+							lines.push(new StringBuilder(getIndent()).append(String.format("%1$" + constraintIndent + "s, ", "")));
+						} else {
+							lines.peek().append(", ");
+						}
+					}
+				}
+			}
+			if(patternConstraintNl && descr.getConstraint().getDescrs().size() > 1) {
+				lines.push(new StringBuilder(getIndent()).append(String.format("%1$"+constraintIndent+ "s)", "")));
+			} else {
+				lines.peek().append(" )");
+			}
+		}
+		
+		if(null != descr.getSource()) {
+			lines.peek().append(" ");
+			_format(descr.getSource());
+		}
+		
+		lines.push(new StringBuilder());
+		
+		return "PatternDescr";
+	}
+
+	private String _format(ExprConstraintDescr descr) {
+		System.out.println("found java: " + descr.getText().replaceAll("\\s+", " "));
+		findFactIds(descr.getText(), lhsFactIds);
+		lines.peek().append(descr.getText().replaceAll("\\s+", " "));
+		return "ExprConstraintDescr";
+	}
+
+	/*
+	 * This should be changed to parse the java up using the dlxr parser
+	 */
+	private void findFactIds(String text, Collection<String> set) {
+		findTexts(text, set, "factValue.text in \\([^)]+\\)", "\\d+");
+		findTexts(text, set, "insertLogicalExclusiveDerivedFact\\(\\w+, \"\\d+\"", "\\d+");
+		findTexts(text, set, "\\d{5}");
+	}
+	
+	private void findTexts(String fullText, Collection<String> set, String... regexes) {
+		LinkedList<String> unsearched, searching = new LinkedList<>();
+		searching.add(fullText);
+		for(String regex : regexes) {
+			unsearched = new LinkedList<>();
+			for(String text : searching) {
+				Matcher m = Pattern.compile(regex).matcher(text);
+				while (m.find()) {
+					unsearched.add(m.group());
+				}
+			}
+			searching = unsearched;
+		}
+		for(String found : searching) {
+			set.add(found);
+		}
+	}
+	
+	private static final class StringStack extends Stack<StringBuilder> {
+		private static final long serialVersionUID = 1L;
+
+		public StringStack() {
+			this.push(new StringBuilder());
+		}
+		
+		@Override
+		public String toString() {
+			StringBuilder sb = new StringBuilder();
+			for(StringBuilder line : this) {
+				sb.append(line).append(RN);
+			}
+			return sb.toString();
+		}
+	}
+	
+	private static enum FormatAction {
+		AndDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((AndDescr)descr);
+			}
+		},
+		OrDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((OrDescr)descr);
+			}
+		},
+		FromDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((FromDescr)descr);
+			}
+		},
+		AccumulateDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((AccumulateDescr)descr);
+			}
+		},
+		ExprConstraintDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((ExprConstraintDescr)descr);
+			}
+		},
+		PatternDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((PatternDescr)descr);
+			}
+		},
+		EvalDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((EvalDescr)descr);
+			}
+		},
+		RuleDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((RuleDescr)descr);
+			}
+		},
+		NotDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((NotDescr)descr);
+			}
+		},
+		ExistsDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((ExistsDescr)descr);
+			}
+		},
+		ForallDescr{
+			@Override
+			void format(RuleWriter rw, BaseDescr descr) {
+				rw._format((ForallDescr)descr);
+			}
+		};
+		
+		abstract void format(RuleWriter rw, BaseDescr descr);
+	}
+	
+	public static void main(String[] args) {
+		try {
+			String formatted = RuleWriter.formatFile("C:\\Users\\G81146\\Documents\\workspace\\hev-drools-derivedFact\\src\\main\\resources\\com\\cigna\\coderunner\\internal\\rules\\urn-coderunner-Medical-Profile-DerivedFact-35-49997-65682-2.drl");
+			System.out.println(formatted);
+		} catch (DroolsParserException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+	}
+}
